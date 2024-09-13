@@ -1,96 +1,84 @@
 import json
 import torch
-from transformers import BertTokenizer, BertModel
+from transformers import BertTokenizer, BertModel, BertForSequenceClassification
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-
-# Class for loading HotpotQA dataset
-class HotpotQADataset(Dataset):
-    def __init__(self, json_file, tokenizer, max_len=512):
-        self.trainData = self._load_data(json_file)
-        self.tokenizer = tokenizer
-        self.max_len = max_len
-
-
-    def _processHotpotQA(train_json, output_json):
-        with open(train_json, 'r') as infile:
-            data = json.load(infile)['data']
-        
-        processed_data = []
-        
-        for entry in data:
-            question = entry['question']
-            supporting_docs = {fact[0] for fact in entry['supporting_facts']}
-            
-            for context in entry['context']:
-                doc_title = context[0]
-                doc_content = ' '.join(context[1])  # Concatenate all sentences in the document
-                is_relevant = 1 if doc_title in supporting_docs else 0
-                
-                # Create a dict for the processed data
-                processed_data.append({
-                    'query': question,
-                    'docContent': f"{doc_title}: {doc_content}",
-                    'relevance': is_relevant
-                })
-        
-        with open(output_json, 'w') as outfile:
-            json.dump(processed_data, outfile, indent=4)
-
-
+import sys
+print(sys.executable)
+import config
+import os
+from tqdm import tqdm
 # Class to perform Query Likelihood computation
 class QueryLikelihood:
-    def __init__(self, model_name='bert-base-uncased'):
-        self.tokenizer = BertTokenizer.from_pretrained(model_name)
-        self.model = BertModel.from_pretrained(model_name)
+    def __init__(self):
+        modelName = 'bert-base-uncased'
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.tokenizer = BertTokenizer.from_pretrained(modelName)
+        self.model = BertModel.from_pretrained(modelName).to(self.device)
 
-    def compute_log_likelihood(self, document, query):
-        inputs = self.tokenizer.encode_plus(
-            document, 
-            query, 
-            add_special_tokens=True, return_tensors='pt', truncation=True, max_length=512
-        )
-        # Pass through BERT to get logits
-        outputs = self.model(**inputs)
-        logits = outputs.logits  # Shape: (batch_size, sequence_length, hidden_size)
-        query_start_idx = (inputs['input_ids'] == self.tokenizer.sep_token_id).nonzero(as_tuple=True)[1].item() + 1
-        
-        # Extract query logits
-        query_logits = logits[0, query_start_idx:, :]
-        norm_logits = F.softmax(query_logits, dim=-1)
-        log_likelihood = torch.sum(torch.log(norm_logits), dim=0)
+    def computeLogLikelihood(self, qeuries, batchSize=32):
+        pairs = []
+
+        for ix in tqdm(range(0, len(qeuries))):
+            record = qeuries[ix]
+            query = record['query']
+            for relDoc in record['relDocContent']:
+                pairs.append((relDoc, query, 1)) # 1 as this is relDoc query pair
+
+            for notRelDoc in record['notRelDocs']:
+                pairs.append((notRelDoc, query, 0)) # 0 as this is noRelDoc query pair
+
+        print(f'Total Pairs: {len(pairs)}')
+
+        print(f'Training...')
+        for ix in tqdm(range(0, len(pairs), batchSize)):        
+            batch = pairs[ix:ix+batchSize]
+            docBatch = [pair[0] for pair in batch]
+            queryBatch = [pair[1] for pair in batch]
+
+            # Batch encoding using batch_encode_plus
+            encoded_inputs = self.tokenizer.batch_encode_plus(
+                list(zip(docBatch, queryBatch)),      # Pairs of documents and queries
+                add_special_tokens=True,            # Add [CLS] and [SEP] tokens
+                max_length=512,
+                truncation=True,
+                padding=True,
+                return_tensors='pt'
+            ).to(self.device)
+
+            outputs = self.model(**encoded_inputs)
+            hidden_states = outputs.last_hidden_state   # Shape: (batch_size, sequence_length, hidden_size)
+
+            linear_projection = torch.nn.Linear(hidden_states.size(-1), self.tokenizer.vocab_size).to(self.device)
+            logits = linear_projection(query_hidden_states) # Shape (batch_size, queryLen , vocab_size)
+            probs = F.softmax(logits, dim=-1)
+
+            startIdxs = []
+            endIdxs = []
+            # Find the index where query starts and ends for each input in the batch
+            for i, mask in enumerate(encoded_inputs['attention_mask']):
+                sep_token_id = self.tokenizer.sep_token_id
+                sep_positions = (encoded_inputs['input_ids'] == sep_token_id).nonzero(as_tuple=True)[1]
+                startIdxs.append(sep_positions[0].item() + 1)
+                endIdxs.append(sep_positions[1].item() - 1)
+
+            # startIdxs and endIdxs are indices where query tokens starts and ends
+            # this will be 30k dimensional vocab vector 
+            # apply softmax over last dimension (dim=-1) and then find probability for tokens
+            
+
         return log_likelihood.item()
-
-# Utility function for preprocessing and computing likelihood over HotpotQA dataset
-class HotpotQAProcessor:
-    def __init__(self, dataset, model_name='bert-base-uncased'):
-        self.dataset = dataset
-        self.query_likelihood = QueryLikelihood(model_name)
-
-    def process(self, batch_size=8):
-        data_loader = DataLoader(self.dataset, batch_size=batch_size, shuffle=False)
-        results = []
-        for batch in data_loader:
-            for idx in range(len(batch['input_ids'])):
-                doc_tokens = batch['input_ids'][idx].tolist()
-                doc_text = self.dataset.tokenizer.decode(doc_tokens, skip_special_tokens=True)
-                query_text = batch['token_type_ids'][idx].tolist()  # Assuming query tokens follow token_type_ids == 1
-                likelihood = self.query_likelihood.compute_log_likelihood(doc_text, query_text)
-                results.append(likelihood)
-        return results
-
 
 # Main execution
 if __name__ == "__main__":
-    model_name = 'bert-base-uncased'
-    tokenizer = BertTokenizer.from_pretrained(model_name)
-    
     # Load HotpotQA training data
-    hotpot_data = HotpotQADataset('hotpot_train_v1.1.json', tokenizer)
-
+    trainDumpFile = os.path.join(config.A1_DATA_DUMP, 'hotpotTrain.json')
+    with open(trainDumpFile, 'r') as trainFile:
+        trainData = json.load(trainFile)
+         
     # Process data and compute query likelihoods
-    processor = HotpotQAProcessor(hotpot_data, model_name=model_name)
-    likelihoods = processor.process(batch_size=4)
+    model = QueryLikelihood()
+    likelihoods = model.computeLogLikelihood(trainData, batchSize=1)
 
     # Print out the computed likelihoods for all samples
     print(likelihoods)
