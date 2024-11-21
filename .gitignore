@@ -162,7 +162,17 @@ cython_debug/
 #.idea/
 
 # Added by me
-Assignment1/dataDump/*
-*.pdf
+Assignment1
+Assignment1/dataDump/
+sandbox.py
+*.json
+
+# *.pdf
+*.zip
 config.py
 utils.py
+.gitignore
+try.py
+*.yml
+sandbox.ipynb
+wandb
