@@ -166,6 +166,7 @@ Assignment1
 Assignment1/dataDump/
 sandbox.py
 *.json
+data
 
 # *.pdf
 *.zip
